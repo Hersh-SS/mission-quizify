@@ -4,17 +4,29 @@ import os
 import sys
 import json
 import logging
+from pydantic import BaseModel, Field, ValidationError
 sys.path.append(os.path.abspath('../../'))
 from tasks.task_3.task_3 import DocumentProcessor
 from tasks.task_4.task_4 import EmbeddingClient
 from tasks.task_5.task_5 import ChromaCollectionCreator
 
 from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_google_vertexai import VertexAI
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+class Choice(BaseModel):
+    key: str
+    value: str
+
+class QuizQuestion(BaseModel):
+    question: str
+    choices: list[Choice]
+    answer: str
+    explanation: str
 
 class QuizGenerator:
     def __init__(self, topic=None, num_questions=1, vectorstore=None):
@@ -62,7 +74,7 @@ class QuizGenerator:
             
             Context: {context}
             """
-    
+
     def init_llm(self):
         """
         Initializes and configures the Large Language Model (LLM) for generating quiz questions.
@@ -100,46 +112,21 @@ class QuizGenerator:
         else:
             context = "No context available"
 
-        # Create the prompt
-        prompt = self.system_template.format(topic=self.topic, context=context)
+        # Set up a parser + inject instructions into the prompt template
+        parser = JsonOutputParser(pydantic_object=QuizQuestion)
+        prompt = PromptTemplate(
+            template=self.system_template,
+            input_variables=["topic", "context"],
+            partial_variables={"format_instructions": parser.get_format_instructions()},
+        )
+
+        # Create the chain with prompt, model, and parser
+        chain = prompt | self.llm | parser
 
         # Generate the quiz question
-        response = self.llm(prompt)
+        response = chain.invoke({"topic": self.topic, "context": context})
 
         return response
-
-    def post_process_response(self, response):
-        """
-        Attempts to clean and format the LLM response to ensure it is valid JSON.
-        :param response: The raw response from the LLM
-        :return: A dictionary if the response is valid JSON, None otherwise
-        """
-        try:
-            # First, attempt to directly parse the response as JSON
-            question = json.loads(response)
-            return question
-        except json.JSONDecodeError:
-            # Log the failed response for further analysis
-            logger.error(f"Failed to decode JSON directly: {response}")
-            
-            # Try to fix common issues such as unescaped quotes or missing braces
-            try:
-                response = response.replace('\n', '')
-                response = response.replace('“', '"').replace('”', '"')
-                
-                # Ensure property names are enclosed in double quotes
-                response = re.sub(r'(\w+):', r'"\1":', response)
-                
-                # Ensure it starts and ends with a curly brace
-                if not response.startswith('{'):
-                    response = '{' + response
-                if not response.endswith('}'):
-                    response = response + '}'
-                question = json.loads(response)
-                return question
-            except Exception as e:
-                logger.error(f"Failed to post-process response: {e}")
-                return None
 
     def generate_quiz(self) -> list:
         """
@@ -164,10 +151,8 @@ class QuizGenerator:
 
         for _ in range(self.num_questions):
             for attempt in range(retry_limit):
-                question_str = self.generate_question_with_vectorstore()
-                logger.info(f"Raw LLM Response: {question_str}")
-
-                question = self.post_process_response(question_str)
+                question = self.generate_question_with_vectorstore()
+                logger.info(f"Raw LLM Response: {question}")
 
                 if question:
                     break  # Exit retry loop if successful
@@ -181,7 +166,7 @@ class QuizGenerator:
 
         return self.question_bank
 
-    def validate_question(self, question: dict) -> bool:
+    def validate_question(self, question: QuizQuestion) -> bool:
         """
         Task: Validate a quiz question for uniqueness within the generated quiz.
 
